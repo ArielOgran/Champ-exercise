@@ -1,0 +1,228 @@
+---
+title: "Chanpions Oncology - Exercise for bioinformatics candidates"
+author: "Arik Ogran"
+date: "3/1/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# General useful
+```{r}
+`%notin%` <- Negate(`%in%`)
+```
+
+# Installing R base packages which are not yet installed
+```{r}
+# R Package to load
+R_packages <- c("ggplot2", "stats", "dplyr", "tidyr", "ggfortify", "knitr", "lubridate", "imputeMissings", "stringr", "assist", "ggstatsplot", "forcats", "remedy",  "magrittr", "tidyverse", "devtools")
+# Install packages not yet installed
+R_packages_to_install <- R_packages %notin% rownames(installed.packages())
+if (any(R_packages_to_install == TRUE)) {
+  install.packages(R_packages[R_packages_to_install])
+}
+# R Packages loading
+invisible(lapply(R_packages, library, character.only = TRUE))
+```
+
+# Installing Bioconductor packages which are not yet installed
+```{r}
+# # Bioconductor installation
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# BiocManager::install(version = "3.14")
+
+# BioC Package to load
+BioC_packages <- c("DESeq2", "edgeR","biomaRt")
+# Install packages not yet installed
+BioC_already_exists <- installed.packages() %>% rownames() %>% devtools::package_info() %>% filter(source == "Bioconductor") %>% as.data.frame() %>% rownames()
+BioC_packages_to_install <- BioC_packages %notin% BioC_already_exists
+if (any(BioC_packages_to_install == TRUE)) {
+  BiocManager::install(BioC_packages[BioC_packages_to_install])
+}
+# BioC Packages loading
+invisible(lapply(BioC_packages, library, character.only = TRUE))
+```
+
+# Load the data into R and make sure the count and annotation data are consistentwith each other.
+```{r}
+counts_df <- read.delim("counts.txt")
+# converting counts_df to matrix
+rownames(counts_df) <- counts_df[,1]
+cts <- as.matrix(counts_df[,-1])
+coldata <- read.delim("sample-annotation.txt")
+rownames(coldata) <- coldata[,1]
+gene_anno <- read.delim("gene-annotation.txt")
+rownames(gene_anno) <- gene_anno[,1]
+```
+
+## Missing data: gene-annotation.txt file is missing allot of genes which are presented in the counts.txt file
+```{r}
+# total ensemble genes in gene-annotation.txt
+nrow(cts) #57992 genes
+rownames(cts) %>% unique() %>% length() #57992 non-duplicated what so ever
+# Total genes annotated in gene-annotation.txt file
+nrow(gene_anno) #25503 genes
+# How many genes of cts does not have annotation in gene-annotation.txt
+sum(rownames(cts) %notin% rownames(gene_anno)) # 32489 genes
+
+```
+## Fetching more gene symbols using Biomart.
+Reason: In ExpressionSet, the number of rows in featureData must match the number of rows in assayData
+```{r}
+# Biomart
+mart <- useMart("ENSEMBL_MART_ENSEMBL")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+#listAttributes(ensembl)
+ensLookup <- rownames(cts)
+
+annotLookup <- getBM(
+  mart=mart,
+  attributes=c("ensembl_gene_id",
+    "gene_biotype","hgnc_symbol"), # "external_gene_name"
+  filter="ensembl_gene_id",
+  values=ensLookup,
+  uniqueRows=TRUE)
+
+print(paste(nrow(annotLookup), "genes have been annotated by Biomart")) # 57051
+
+# counts.txt Genes not been annotated by Biomart
+non_annotated_genes <- rownames(cts)[which(rownames(cts) %notin% annotLookup[,1])] # 944 genes
+# adding 'non_annotated_genes' as empty row to the annotLookup by Biomart
+empty_anno <- data.frame(ensembl_gene_id=non_annotated_genes, gene_biotype=rep(NA, length(non_annotated_genes)), hgnc_symbol=rep(NA, length(non_annotated_genes)))
+
+# adding non annotated ensambel gene to the annotLookup
+annotLookup_with_empty_rows <- rbind(annotLookup, empty_anno)
+#some how Biomart exported 3 duplicated rows
+nrow(annotLookup_with_empty_rows) # 57995 genes compared to the 57992 genes in the counts.txt file
+# remove duplicated rows (first remained)
+annotLookup_with_empty_rows <- annotLookup_with_empty_rows %>% distinct(ensembl_gene_id, .keep_all = TRUE)
+nrow(annotLookup_with_empty_rows) #finally, a 57992 ensemble genes with distinct symbols
+#setting genes in order
+sum(annotLookup_with_empty_rows[,1] %in% rownames(cts))
+rownames(annotLookup_with_empty_rows) <- annotLookup_with_empty_rows$ensembl_gene_id
+annotLookup_with_empty_rows <- annotLookup_with_empty_rows[rownames(cts),]
+```
+
+# Contruction of S4 object and quality control  
+## Does count matrix and column data consistent in terms of sample order?
+It is absolutely critical that the columns of the count matrix and the rows of the column data (information about samples) are in the same order. 
+```{r}
+# Test and set samples in order 
+if (any(!colnames(cts) == rownames(coldata))){
+  cts <- cts[,rownames(coldata)]
+}
+if (all(rownames(coldata) == colnames(cts))){
+  print("Sample order is consistant")
+}
+```
+
+## ExpressionSet building and coercion to SummarizedExperiment
+```{r}
+metadata <- data.frame(labelDescription=c("samples","skin type"),
+                       row.names=c("sample_id", "type"))
+phenoData <- new("AnnotatedDataFrame",data=coldata, varMetadata=metadata) # type: lesional vs normal
+
+features <- data.frame(labelDescription=c("ensembl_gene_id", "gene_biotype","hgnc_symbol"),
+                       row.names=c("ensembl_gene_id", "gene_biotype","hgnc_symbol"))
+annotation <- new("AnnotatedDataFrame",data=annotLookup_with_empty_rows, varMetadata=features)
+
+GSE54456_RNAseq <- ExpressionSet(assayData=cts,
+                                 phenoData=phenoData,
+                                featureData=annotation) # 
+exprs(GSE54456_RNAseq)
+phenoData(GSE54456_RNAseq)
+sampleNames(GSE54456_RNAseq)
+featureNames(GSE54456_RNAseq)
+
+GSE54456_RNAseq_SE <- makeSummarizedExperimentFromExpressionSet(GSE54456_RNAseq)
+
+GSE54456_RNAseq_SE$type <-  as.factor(GSE54456_RNAseq_SE$type)
+```
+
+## Subset by support: Filter the count data for lowly-expressed genes, for example, only keep genes with a CPM >= 1 in at least 75% samples, in at least one of the groups.
+
+```{r}
+# computing CPM
+cpm <- apply(cts, 2, 
+             function(x) x/sum(as.numeric(x)) * 10^6)
+# Check that the sum of each column (sample) after normalization equals to 10^6
+colSums(cpm) 
+# assign new "cpm" assay
+assay(GSE54456_RNAseq_SE, "cpm") <- cpm
+
+# samples count per skin type  
+lesional_samples <- sum(colData(GSE54456_RNAseq_SE)$type == "lesional")
+normal_samples <- sum(colData(GSE54456_RNAseq_SE)$type == "normal")
+
+# Calculate support for lesional group
+rowData(GSE54456_RNAseq_SE)$lesional_CPM_support <- as.integer(rowSums(assay(GSE54456_RNAseq_SE[,GSE54456_RNAseq_SE$type == "lesional"], "cpm") >= 1))
+# Calculate support for normal group
+rowData(GSE54456_RNAseq_SE)$normal_CPM_support <- as.integer(rowSums(assay(GSE54456_RNAseq_SE[,GSE54456_RNAseq_SE$type == "normal"], "cpm") >= 1))
+
+# gene count before filtering out lowly expressed genes
+before <- nrow(GSE54456_RNAseq_SE)
+    
+# Subset
+GSE54456_RNAseq_SE_filtered <- GSE54456_RNAseq_SE[which(100 * (rowData(GSE54456_RNAseq_SE)$lesional_CPM_support / lesional_samples) >= 75 | 
+                                                  100 * (rowData(GSE54456_RNAseq_SE)$normal_CPM_support / normal_samples) >= 75)  , ]
+after <- nrow(GSE54456_RNAseq_SE_filtered)
+removed <- before - after
+    
+# Print summary for subset by support 
+message("Removed ", removed, " out of ", before, " genes (", round(removed/before * 100, digits = 1), "%)")
+```
+
+# Generate an object that contains the library-size normalized log-CPM data. Saveit as a binary file (.rda or .rds).
+```{r}
+log_cpm <- apply(cts, 2, 
+             function(x) log(x/sum(as.numeric(x)) * 10^6))
+save(log_cpm, file="logCPM.rda")
+```
+
+# The PCA plot may suggest the presence of outlier/mis-labeled samples in this dataset. Try to identify them and remove them from the downstream analysis.
+```{r}
+library(stats)
+library(ggplot2)
+# transpose the matrix 
+M <- t(cpm)
+# transform the counts to log2 scale 
+M <- log2(M + 1)
+# compute PCA 
+pcaResults <- prcomp(M)
+
+# plot PCA results making use of ggplot2's autoplot function
+# ggfortify is needed to let ggplot2 know about PCA data structure. 
+autoplot(pcaResults, data = coldata, colour = 'type')
+
+# identify the outlier/mis-labeled sample
+mis_labeled <- rownames(pcaResults$x)[pcaResults$x[,"PC1"] < -0.05 & rownames(pcaResults$x) %in% coldata$sample_id[coldata$type == "lesional"]]
+
+# removing outlier/mis-labeled sample/s
+GSE54456_RNAseq_SE_filtered <- GSE54456_RNAseq_SE_filtered[,which(GSE54456_RNAseq_SE_filtered$sample_id != mis_labeled)]
+# 
+```
+
+# Building DESeq object
+```{r}
+#colData(GSE54456_RNAseq_SE)
+ddsSE <- DESeqDataSet(GSE54456_RNAseq_SE, design = ~ type)
+#ddsSE$type
+
+```
+
+
+
+
+```{r}
+# dependencies for this Rmarkdown to run 
+```
+
+
+
+```{r}
+sessionInfo()
+```
+
