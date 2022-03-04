@@ -1,0 +1,299 @@
+---
+title: "Chanpions Oncology - Exercise for bioinformatics candidates"
+author: "Arik Ogran"
+date: "3/1/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Useful shortcut
+```{r}
+`%notin%` <- Negate(`%in%`)
+```
+
+### Installing R base packages which are not yet installed
+```{r message = FALSE, warning = FALSE}
+# R Package to load
+R_packages <- c("ggplot2", "stats", "dplyr", "tidyr", "ggfortify", "knitr", "lubridate", "imputeMissings", "stringr", "assist", "ggstatsplot", "forcats", "remedy",  "magrittr", "tidyverse", "devtools", "kableExtra", "pheatmap")
+# Install packages not yet installed
+R_packages_to_install <- R_packages %notin% rownames(installed.packages())
+if (any(R_packages_to_install == TRUE)) {
+  install.packages(R_packages[R_packages_to_install])
+}
+# R Packages loading
+invisible(lapply(R_packages, library, character.only = TRUE))
+```
+
+### Installing Bioconductor packages which are not yet installed
+```{r warning = FALSE, message = FALSE}
+# # Bioconductor installation
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# BiocManager::install(version = "3.14")
+
+# BioC Package to load
+BioC_packages <- c("DESeq2", "edgeR","biomaRt", "EnhancedVolcano")
+# Install packages not yet installed
+BioC_already_exists <- installed.packages() %>% rownames() %>% devtools::package_info() %>% filter(source == "Bioconductor") %>% as.data.frame() %>% rownames()
+BioC_packages_to_install <- BioC_packages %notin% BioC_already_exists
+if (any(BioC_packages_to_install == TRUE)) {
+  BiocManager::install(BioC_packages[BioC_packages_to_install])
+}
+# BioC Packages loading
+invisible(lapply(BioC_packages, library, character.only = TRUE))
+```
+
+### Load the data into R and make sure the count and annotation data are consistentwith each other.
+```{r}
+# Setting working directory to hold raw data and outputs
+setwd("~/iCloud/Bioinformatics courses and tools/Chanpions Oncology - Exercise for bioinformatics candidates")
+counts_df <- read.delim("counts.txt")
+# converting counts_df to matrix
+rownames(counts_df) <- counts_df[,1]
+cts <- as.matrix(counts_df[,-1])
+coldata <- read.delim("sample-annotation.txt")
+rownames(coldata) <- coldata[,1]
+gene_anno <- read.delim("gene-annotation.txt")
+rownames(gene_anno) <- gene_anno[,1]
+message("Files have been loaded- count.txt, sample-annotation.txt and gene-annotation.txt")
+```
+
+#### Missing data: gene-annotation.txt file is missing allot of genes which are presented in the counts.txt file
+```{r}
+cat("total ensemble genes in gene-annotation.txt:", nrow(cts)) #57992 genes
+cat("total non-duplicated ensemble genes in gene-annotation.txt:", rownames(cts) %>% unique() %>% length()) #57992 
+cat("Total genes annotated in gene-annotation.txt file:", nrow(gene_anno)) #25503 genes
+cat("Genes from counts.txt file that does not have annotation in gene-annotation.txt:", sum(rownames(cts) %notin% rownames(gene_anno))) # 32489 genes
+```
+
+#### Fetching more gene symbols using Biomart.
+Reason: In ExpressionSet, the number of rows in featureData must match the number of rows in assayData
+```{r}
+# Biomart
+mart <- useMart("ENSEMBL_MART_ENSEMBL")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+
+# ensemble genes (from count.txt) to annotate by Biomart
+ensLookup <- rownames(cts)
+
+# Getting hgnc_symbol from Biomart
+annotLookup <- getBM(mart=mart, attributes=c("ensembl_gene_id","gene_biotype","hgnc_symbol"), # "external_gene_name"
+  filter="ensembl_gene_id",
+  values=ensLookup,
+  uniqueRows=TRUE)
+
+cat(nrow(annotLookup), "genes have been annotated by Biomart") # 57051
+
+# counts.txt Genes not been annotated by Biomart
+non_annotated_genes <- rownames(cts)[which(rownames(cts) %notin% annotLookup[,1])] # 944 genes
+cat(length(non_annotated_genes), "counts.txt Genes not annotated by Biomart" )
+
+# adding 'non_annotated_genes' as empty row to the annotLookup by Biomart
+empty_anno <- data.frame(ensembl_gene_id=non_annotated_genes, gene_biotype=rep(NA, length(non_annotated_genes)), hgnc_symbol=rep(NA, length(non_annotated_genes)))
+
+# adding non annotated ensemble gene to the annotLookup
+annotLookup_with_empty_rows <- rbind(annotLookup, empty_anno)
+
+# Biomart exported 3 extra duplicated rows (annotations) with different 'hgnc_symbol'
+cat("Biomart output of gene annotation contained", nrow(annotLookup_with_empty_rows), "rows of 57992 genes")
+
+# remove duplicated rows (first remained)
+message("Removeing duplicated rows (first remained)")
+annotLookup_with_empty_rows <- annotLookup_with_empty_rows %>% distinct(ensembl_gene_id, .keep_all = TRUE)
+nrow(annotLookup_with_empty_rows) #finally, 57992 ensemble genes with distinct symbols
+cat("finally, 57992 ensemble genes from count.txt with distinct symbols")
+
+#setting genes in order same as in count.txt
+rownames(annotLookup_with_empty_rows) <- annotLookup_with_empty_rows$ensembl_gene_id
+annotLookup_with_empty_rows <- annotLookup_with_empty_rows[rownames(cts),]
+```
+
+### Contruction of S4 object and quality control  
+#### Does count matrix and column data consistent in terms of sample order?
+It is absolutely critical that the columns of the count matrix and the rows of the column data (information about samples) are in the same order. 
+```{r}
+# Test and set samples in order in count.txt and sample-annotation.txt
+if (any(!colnames(cts) == rownames(coldata))){
+  cts <- cts[,rownames(coldata)]
+}
+if (all(rownames(coldata) == colnames(cts))){
+  print("Sample order in count.txt and sample-annotation.txt is check and found consistant")
+}
+```
+
+#### ExpressionSet object building and coercion to SummarizedExperiment
+```{r}
+# setting matadata for phenoData
+metadata <- data.frame(labelDescription=c("samples","skin type"),
+                       row.names=c("sample_id", "type"))
+phenoData <- new("AnnotatedDataFrame",data=coldata, varMetadata=metadata) # type: lesional vs normal
+
+# setting features for gene annotations
+features <- data.frame(labelDescription=c("ensembl_gene_id", "gene_biotype","hgnc_symbol"),
+                       row.names=c("ensembl_gene_id", "gene_biotype","hgnc_symbol"))
+annotation <- new("AnnotatedDataFrame",data=annotLookup_with_empty_rows, varMetadata=features)
+# building object
+GSE54456_RNAseq <- ExpressionSet(assayData=cts,
+                                 phenoData=phenoData,
+                                featureData=annotation) 
+
+# exprs(GSE54456_RNAseq)
+# phenoData(GSE54456_RNAseq)
+# sampleNames(GSE54456_RNAseq)
+# featureNames(GSE54456_RNAseq)
+
+# coercing to SummarizedExperiment
+GSE54456_RNAseq_SE <- makeSummarizedExperimentFromExpressionSet(GSE54456_RNAseq)
+message("ExpressionSet object has been built and coerced to SummarizedExperiment")
+# setting sample type as factor
+GSE54456_RNAseq_SE$type <-  as.factor(GSE54456_RNAseq_SE$type)
+```
+
+#### Subset by support: Filter the count data for lowly-expressed genes, for example, only keep genes with a CPM >= 1 in at least 75% samples, in at least one of the groups.
+```{r}
+# computing CPM
+cpm <- apply(cts, 2, 
+             function(x) x/sum(as.numeric(x)) * 10^6)
+# Check that the sum of each column (sample) after normalization equals to 10^6
+# colSums(cpm) 
+
+# assign new "cpm" assay
+assay(GSE54456_RNAseq_SE, "cpm") <- cpm
+message("CPM has assigned to new assay of  GSE54456_RNAseq_SE SummarizedExperiment")
+
+# samples count per skin type  
+lesional_samples <- sum(colData(GSE54456_RNAseq_SE)$type == "lesional")
+normal_samples <- sum(colData(GSE54456_RNAseq_SE)$type == "normal")
+
+# Calculate support for lesional group
+rowData(GSE54456_RNAseq_SE)$lesional_CPM_support <- as.integer(rowSums(assay(GSE54456_RNAseq_SE[,GSE54456_RNAseq_SE$type == "lesional"], "cpm") >= 1))
+# Calculate support for normal group
+rowData(GSE54456_RNAseq_SE)$normal_CPM_support <- as.integer(rowSums(assay(GSE54456_RNAseq_SE[,GSE54456_RNAseq_SE$type == "normal"], "cpm") >= 1))
+
+# gene count before filtering out lowly expressed genes
+before <- nrow(GSE54456_RNAseq_SE)
+    
+# Subset
+GSE54456_RNAseq_SE_filtered <- GSE54456_RNAseq_SE[which(100 * (rowData(GSE54456_RNAseq_SE)$lesional_CPM_support / lesional_samples) >= 75 | 
+                                                  100 * (rowData(GSE54456_RNAseq_SE)$normal_CPM_support / normal_samples) >= 75)  , ]
+message("Lowly-expresssed genes have been filtered out from GSE54456_RNAseq_SE ")
+
+after <- nrow(GSE54456_RNAseq_SE_filtered)
+removed <- before - after
+    
+# Print summary for subset by support 
+message("Removed ", removed, " out of ", before, " genes (", round(removed/before * 100, digits = 1), "%)")
+```
+
+### Generate an object that contains the library-size normalized log-CPM data. Saveit as a binary file (.rda or .rds).
+```{r}
+log_cpm <- apply(cts, 2, 
+             function(x) log(x/sum(as.numeric(x)) * 10^6))
+save(log_cpm, file="logCPM.rda")
+message("Binnary file of library-size normalized log-CPM data has been exported to working directory")
+```
+
+### The PCA plot may suggest the presence of outlier/mis-labeled samples in this dataset. Try to identify them and remove them from the downstream analysis.
+Before performing statistical tests for various measures of Differential Expression (DE), it is important to first conduct a thorough Exploratory Data Analysis (EDA) to identify what factors we need to include in the final DE model. In this exercise case we wont look for a factor but only mis-labaled samples to remove.
+```{r}
+# transpose the matrix 
+M <- t(cpm)
+# transform the counts to log2 scale 
+M <- log2(M + 1)
+# compute PCA 
+pcaResults <- prcomp(M)
+
+# plot PCA results making use of ggplot2's autoplot function
+# ggfortify is needed to let ggplot2 know about PCA data structure. 
+autoplot(pcaResults, data = coldata, colour = 'type')
+cat("Except one sample, we can be split the samples into two distinct clusters on the scatter plot based on largest principal components 1")
+
+# identify the outlier/mis-labeled sample
+mis_labeled <- rownames(pcaResults$x)[pcaResults$x[,"PC1"] < -0.05 & rownames(pcaResults$x) %in% coldata$sample_id[coldata$type == "lesional"]]
+
+# removing outlier/mis-labeled sample/s
+GSE54456_RNAseq_SE_filtered <- GSE54456_RNAseq_SE_filtered[,which(GSE54456_RNAseq_SE_filtered$sample_id != mis_labeled)]
+message("outlier/mis-labeled sample has been removed")
+```
+
+### Differential expression analysis
+Export the results in a tab-separated text/CSV file: a table with genes in rowsalongwith gene annotations and any relevant statistic.
+```{r message = FALSE, warning = FALSE}
+# Building DESeq object from SummarizedExperiment
+ddsSE <- DESeqDataSet(GSE54456_RNAseq_SE_filtered, design = ~ type)
+
+# Normalize and log transform
+vst_blind <- vst(ddsSE, blind = TRUE)
+# PCA-plot of variance stabilized expression
+plotPCA(vst_blind, "type")
+cat("No batch effect was found to be included in the DESeq design")
+
+# compute the contrast for the 'type' variable where 'normal' samples are used as the control group.
+# results are binded to rowData to get gene symbols
+dds <- DESeq(ddsSE)
+DEresults = results(dds, contrast = c("type", 'lesional', 'normal'),  tidy = TRUE) %>%
+                     bind_cols(as.data.frame(rowData(GSE54456_RNAseq_SE_filtered))) %>%
+                     as_tibble()
+#sort results by increasing p-value
+DEresults <- DEresults[order(DEresults$pvalue),]
+
+# How many adjusted p-values were less than 0.1?
+cat(sum(DEresults$padj < 0.1, na.rm=TRUE), " genes are DE with < 0.1 adjusted p-values")
+
+# Exporting to results to .csv file
+write.csv(DEresults,"DEresults.csv")
+```
+
+### Select the top 100 most significant annotated genes and generate a heatmap of the log-CPM data, with samples in columns, annotated with the group variable.
+```{r}
+
+# Show top 100 
+DEresults %>%
+  top_n(n = -100, wt = padj) %>%
+  dplyr::select(Gene = row, 
+                Symbol = hgnc_symbol,
+                baseMean, 
+                log2FoldChange, 
+                padj) %>%
+  kable(caption = "Top differentially expressed genes") %>%
+  kable_styling(latex_options = "hold_position")
+
+# Top 100
+Top_100 <- DEresults %>% arrange (desc(abs(log2FoldChange))) %>% head (100)
+
+# log_cpm pheatmap:
+# Since Count data was filtered to hold genes that expressed in >= 1 CPM in at list 75% of samples, some genes have zero count in some samples which result in log_CPM as -INF.
+# In order to pheatmap log_cpm, -Inf values must be changed to 0
+noInf <- log_cpm
+noInf[which(!is.finite(noInf))] <- 0
+# setting annotation_col
+df <- as.data.frame(colData(ddsSE)[,c("sample_id","type")])
+# ploting pheatmap
+pheatmap(noInf[Top_100$row,], cluster_rows=TRUE, show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=T, annotation_col=df)
+```
+
+### Generate a volcano plot (x-axis is the effect size and y-axis is the p-value) for this analysis. The selected 100 most significant genes should be colored.
+```{r}
+# setting red color  and size for top 100 DE genes
+cols <- ifelse(DEresults$row %in% Top_100$row, 'red', 'black')
+size <- ifelse(DEresults$row %in% Top_100$row, 1.2, 0.6)
+# plotting volcano
+plot(DEresults$log2FoldChange, -log10(DEresults$padj), col=cols, panel.first=grid(),
+     main="Volcano plot", xlab="Effect size: log2(fold-change)", ylab="-log10(adjusted p-value)",
+     pch=20, cex=size)
+abline(v=0, col="black", lty=3, lwd=1.0)
+abline(v=3.5, col="black", lty=4, lwd=2.0)
+abline(v=-3.5, col="black", lty=4, lwd=2.0)
+```
+
+
+```{r}
+sessionInfo()
+```
+
